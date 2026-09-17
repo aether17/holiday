@@ -1,0 +1,86 @@
+name: Publish holiday data
+
+on:
+  schedule:
+    - cron: "17 3 1,15 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: holiday-release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install pinned dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Download current release assets
+        id: previous
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir previous
+          if tag="$(gh release view --json tagName --jq .tagName 2>/dev/null)"; then
+            gh release download "$tag" --pattern "*.json" --dir previous
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate and verify assets
+        run: |
+          args=()
+          if [[ "${{ steps.previous.outputs.found }}" == "true" ]]; then
+            args+=(--previous-dir previous)
+          fi
+          python generate.py --output dist "${args[@]}"
+          python verify.py dist
+
+      - name: Detect data changes
+        id: changes
+        run: |
+          if [[ "${{ steps.previous.outputs.found }}" == "true" ]] && diff -qr previous dist; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Holiday data is unchanged; no release will be published."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish dated release
+        if: steps.changes.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="v$(date -u +%Y%m%d)"
+          nate_sha="$(gh api repos/NateScarlet/holiday-cn/commits/master --jq .sha)"
+          generated_at="$(python -c 'import json; print(json.load(open("dist/index.json"))["generated_at"])')"
+          cat > release-notes.md <<EOF
+          Generated at: $generated_at
+          python-holidays: 0.104
+          NateScarlet/holiday-cn: https://github.com/NateScarlet/holiday-cn/commit/$nate_sha
+          EOF
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/*.json --clobber
+            gh release edit "$tag" --latest --notes-file release-notes.md
+          else
+            gh release create "$tag" dist/*.json --target "$GITHUB_SHA" --title "$tag" --latest --notes-file release-notes.md
+          fi
+          git tag -f latest "$GITHUB_SHA"
+          git push --force origin refs/tags/latest
